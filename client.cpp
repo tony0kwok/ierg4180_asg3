@@ -498,13 +498,13 @@ void response_mode() {
 
 			max_response = (response_time > max_response) ? response_time : max_response;
 			min_response = (response_time < min_response) ? response_time : min_response;
-			average_response = (average_response * total_response + response_time) / (total_response);
+			average_response = (average_response * total_response + response_time) / (total_response + 1);
 
 			double jitter_average = fabs(response_time - average_response);
 			if (total_response == 0)
 				jitter_new = response_time;
 			else
-				jitter_new = (jitter_new * total_response + jitter_average) / (total_response);
+				jitter_new = (jitter_new * total_response + jitter_average) / (total_response + 1);
 
 			total_response += 1;
 
