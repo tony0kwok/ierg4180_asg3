@@ -1,0 +1,4 @@
+client.o
+server.o
+thread.o
+pipe.o
