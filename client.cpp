@@ -2,14 +2,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
+#include <sys/fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <unistd.h>
+#include <errno.h>
 
 #include <getopt.h>
 
@@ -270,7 +273,10 @@ void socket_init() {
 	// ============================
 
 	// Create socket descriptor
-	socket_descriptor = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (strcmp(protocol, "TCP") == 0)
+		socket_descriptor = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	else
+		socket_descriptor = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 	
 	if (socket_descriptor == INVALID_SOCKET) {
 		printf("Client: socket failed. Error code: %i\n", get_socket_error());
@@ -330,8 +336,10 @@ void operating_parameters() {
 
 	// Send to server and initialize connection
 	int iResult;
-	iResult = send(socket_descriptor, (char *) client_params, sizeof(struct operating_parameters), 0);
-
+	if (strcmp(protocol, "TCP") == 0)
+		iResult = send(socket_descriptor, (char *) client_params, sizeof(struct operating_parameters), 0);
+	else
+		iResult = sendto(socket_descriptor, (char *) client_params, sizeof(struct operating_parameters), 0, (struct sockaddr *) &sock_addr, sizeof(struct sockaddr_in));
 	// ========================================
 
 	if (iResult == SOCKET_ERROR) {
@@ -356,8 +364,12 @@ void sending_mode() {
 		sprintf(sendbuf, "%ld", sent_count);
 
 		timer.Start();
-		iResult = send(socket_descriptor, sendbuf, pktsize, 0);
-
+		if (strcmp(protocol, "TCP") == 0) {
+			iResult = send(socket_descriptor, sendbuf, pktsize, 0);
+		}
+		else {
+			iResult = sendto(socket_descriptor, sendbuf, pktsize, 0, (struct sockaddr *) &sock_addr, sizeof(struct sockaddr_in));
+		}
 		double duration = timer.Elapsed();
 
 		if (iResult == SOCKET_ERROR) {
@@ -405,10 +417,12 @@ void receiving_mode() {
 
 	long expected_sequence = 0, incoming_time, previous_time = 0;
 	do {
-		iResult = recv(socket_descriptor, recvbuf, buflen, 0);
-
-		iResult = recvfrom(socket_descriptor, recvbuf, buflen, 0, (struct sockaddr *) &sender_addr, (socklen_t *) &sockaddr_len);
-
+		if (strcmp(protocol, "TCP") == 0) {
+			iResult = recv(socket_descriptor, recvbuf, buflen, 0);
+		}
+		else {
+			iResult = recvfrom(socket_descriptor, recvbuf, buflen, 0, (struct sockaddr *) &sender_addr, (socklen_t *) &sockaddr_len);
+		}
 
 		if (iResult == 0) {
 			printf("Client: connection closing...\n");
@@ -452,9 +466,11 @@ void receiving_mode() {
 		}
 	} while (iResult > 0);
 
-	iResult = shutdown(socket_descriptor, SD_SEND);
-	if (iResult == SOCKET_ERROR) {
-		printf("Client: shutdown failed. Error code: %i\n", get_socket_error());
+	if (strcmp(protocol, "TCP") == 0) {
+		iResult = shutdown(socket_descriptor, SD_SEND);
+		if (iResult == SOCKET_ERROR) {
+			printf("Client: shutdown failed. Error code: %i\n", get_socket_error());
+		}
 	}
 
 	free(recvbuf);

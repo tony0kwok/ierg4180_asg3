@@ -240,21 +240,10 @@ void socket_cleanup() {
 	if (udp_socket != INVALID_SOCKET)
 		closesocket(udp_socket);
 
-	#ifdef _WIN32
-		WSACleanup();
-	#endif
 }
 
 void socket_init() {
 	int iResult;
-	#ifdef _WIN32
-		WSADATA wsaData;
-		iResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
-		if (iResult != 0) {
-			printf("WSAStartup failed: %d\n", iResult);
-			exit(1);
-		}
-	#endif
 
 	memset(&sock_addr, 0, sizeof(struct sockaddr_in));
 	sock_addr.sin_family = AF_INET;
@@ -318,6 +307,16 @@ void socket_init() {
 		socket_cleanup();
 		exit(1);
 	}
+	// ===================
+
+	// UDP bind socket
+	iResult = ::bind(udp_socket, (struct sockaddr *) &sock_addr, sizeof(struct sockaddr_in));
+	if (iResult == SOCKET_ERROR) {
+		printf("Server: UDP bind failed. Error code: %i\n", get_socket_error());
+		socket_cleanup();
+		exit(1);
+	}
+	// ===============
 
 	// Set send and receive buffer size
 	if (sbufsize > 0) {
@@ -459,6 +458,136 @@ void concurrent_client() {
 			free(params_buffer);
 		}
 
+		// UDP socket is available to read
+        if (FD_ISSET(udp_socket, &socket_read_set)) {
+			struct sockaddr_in *client_info = (struct sockaddr_in *) malloc(sizeof(struct sockaddr_in));
+			socklen_t sockaddr_len = sizeof(struct sockaddr_in);
+			
+			// printf("Server: UDP accpeting incoming client\n");
+
+			struct operating_parameters *params_buffer = (struct operating_parameters *) malloc(sizeof(struct operating_parameters));
+			
+			retstat = recvfrom(udp_socket, (char *) params_buffer, sizeof(struct operating_parameters), 0,(struct sockaddr *) client_info, &sockaddr_len);
+
+			if (retstat > 0 || get_socket_error() == WSAEMSGSIZE) {
+				// Find connecting client
+				int client_index = -1;
+				for (int i = 0; i < next_client; i++) {
+					if (sockaddr_equal(&connecting_client[i]->client_addr, client_info) == true) {
+						client_index = i;
+						break;
+					}
+				}
+
+				if (client_index == -1 && next_client < max_client) {
+					struct incoming_client *new_client = (struct incoming_client *) malloc(sizeof(struct incoming_client));
+					memset(&new_client->client_addr, 0, sizeof(struct sockaddr_in));
+
+					new_client->client_addr.sin_family = client_info->sin_family;
+					new_client->client_addr.sin_addr = client_info->sin_addr;
+					new_client->client_addr.sin_port = client_info->sin_port;
+
+					new_client->socket_descriptor = udp_socket;
+					new_client->connection_type = params_buffer->connection_type;
+					new_client->connection_mode = params_buffer->connection_mode;
+					new_client->packet_size = ntohl(params_buffer->packet_size);
+					new_client->packet_rate = ntohl(params_buffer->packet_rate);
+					new_client->packet_number = ntohl(params_buffer->packet_number);
+
+					debug_args(new_client);
+
+					connecting_client[next_client] = new_client;
+					next_client += 1;
+					udp_client += 1;
+
+					// UDP server starts to initialize sending packets to client
+					new_client->next_packet_number = 0;
+					if (new_client->packet_rate > 0)
+						new_client->time_interval = 1000 * new_client->packet_size / new_client->packet_rate;
+					else
+						new_client->time_interval = 0;
+					new_client->next_packet_transmission_time = timer.Elapsed() + new_client->time_interval;
+
+					if (new_client->connection_mode == false) {
+						// printf("Next packet time: %ld\n", new_client->next_packet_transmission_time);
+						FD_SET(udp_socket, &socket_write_set);
+						// printf("Server: Current connecting client %d\n", next_client);
+					}
+					else {
+						new_client->last_packet_expected_time = timer.Elapsed() + new_client->packet_number * new_client->time_interval;
+					}
+				}
+				// UDP client keeps sending packets to server
+				else if (client_index != -1) {
+					// printf("Server: Client %d keeps connecting\n", client_index);
+
+					char *recv_buffer = (char *) params_buffer;
+					connecting_client[client_index]->next_packet_number = atoi(recv_buffer) + 1;
+					// printf("Server: Next packet number %ld\n", connecting_client[client_index]->next_packet_number);
+
+					// Remove from connection since packets are all delivered
+					if (connecting_client[client_index]->next_packet_number == connecting_client[client_index]->packet_number) {
+						free(connecting_client[client_index]);
+						for (int i = client_index + 1; i < max_client; i++)
+							connecting_client[i - 1] = connecting_client[i];
+						next_client -= 1;
+						udp_client -= 1;
+					}
+
+					// printf("Server: Current connecting client %d\n", next_client);
+				}
+				else if (next_client >= max_client)
+					printf("Server: maximum number of clients reached\n");
+			}
+			else
+				printf("Server: recvfrom failed. Error code: %i\n", get_socket_error());
+			
+			free(params_buffer);
+			free(client_info);
+		}
+
+		// UDP socket is available to write
+		if (FD_ISSET(udp_socket, &socket_write_set)) {
+			// Compare with every connected timer and check any packet to send
+			int client_index = -1;
+			for (int i = 0; i < next_client; i++) {
+				if (connecting_client[i]->connection_mode == false && connecting_client[i]->connection_type == false) {
+					// Compare current time and next sending time
+					long current_time = timer.Elapsed();
+					if (current_time >= connecting_client[i]->next_packet_transmission_time) {
+						char *sendbuf = (char *)calloc(connecting_client[i]->packet_size, sizeof(char));
+						memset(sendbuf, 0, connecting_client[i]->packet_size);
+						sprintf(sendbuf, "%ld", connecting_client[i]->next_packet_number);
+
+						int iResult = sendto(udp_socket, sendbuf, connecting_client[i]->packet_size, 0, (struct sockaddr *) &connecting_client[i]->client_addr, sizeof(struct sockaddr_in));
+						if (iResult == SOCKET_ERROR) {
+							printf("Server: sendto failed. Error code: %i\n", get_socket_error());
+						}
+						// printf("Server: Send packet to client %d with packet number %ld\n", i, connecting_client[i]->next_packet_number);
+
+						current_time = timer.Elapsed();
+						long delay_sent = current_time - connecting_client[i]->next_packet_transmission_time;
+
+						connecting_client[i]->next_packet_transmission_time += (connecting_client[i]->time_interval - delay_sent);
+						connecting_client[i]->next_packet_number += 1;
+						free(sendbuf);
+
+						// Remove from connection since packets are all delivered
+						if (connecting_client[i]->next_packet_number == connecting_client[i]->packet_number) {
+							free(connecting_client[i]);
+							for (int j = i + 1; j < max_client; j++)
+								connecting_client[j - 1] = connecting_client[j];
+							next_client -= 1;
+							udp_client -= 1;
+
+							// printf("Server: Current connecting client %d\n", next_client);
+							break;
+						}
+					}
+				}
+			}
+		}
+
 		// Check all TCP sockets
 		for (int i = 0; i < next_client; i++) {
 			if (connecting_client[i]->connection_type == true) {
@@ -543,6 +672,19 @@ void concurrent_client() {
 					}
 				}
 			}
+			// Check UDP idle
+			else {
+				if (connecting_client[i]->connection_mode == true) {
+					if (timer.Elapsed() >= connecting_client[i]->last_packet_expected_time) {
+						free(connecting_client[i]);
+						for (int j = i + 1; j < max_client; j++)
+							connecting_client[j - 1] = connecting_client[j];
+						next_client -= 1;
+						udp_client -= 1;
+						i -= 1;
+					}
+				}
+			}
 		}
 
 	}
@@ -573,7 +715,17 @@ void thread_collector(void *input) {
 				client_lock->unlock();
 				i = -1;
 			}
-
+			// ==========================================
+			else {
+				// Only for UDP connection when server receives data from client
+				if (connecting_client[i]->connection_type == false && connecting_client[i]->connection_mode == true) {
+					if (timer.Elapsed() >= connecting_client[i]->last_packet_expected_time) {
+						close_connection[i] = true;
+						i -= 1;
+					}
+				}
+				// =============================================================
+			}
 		}
 
 		if (next_client > max_client / 2) {
@@ -786,6 +938,158 @@ void tcp_handler(void *input) {
 }
 // ===================================
 
+// UDP read from client or initialize new UDP connection
+void udp_read_handler(void *input) {
+	while (keep_running == true) {
+		struct sockaddr_in *client_info = (struct sockaddr_in *) malloc(sizeof(struct sockaddr_in));
+		socklen_t sockaddr_len = sizeof(struct sockaddr_in);
+
+		struct operating_parameters *params_buffer = (struct operating_parameters *) malloc(sizeof(struct operating_parameters));
+		
+		int retstat = recvfrom(udp_socket, (char *) params_buffer, sizeof(struct operating_parameters), 0,(struct sockaddr *) client_info, &sockaddr_len); 
+
+		if (retstat > 0 || get_socket_error() == WSAEMSGSIZE) {
+			struct incoming_client *thread_client = NULL;
+
+			// Find connecting client
+			int client_index = -1;
+			client_lock->lock();
+			for (int i = 0; i < next_client; i++) {
+				if (sockaddr_equal(&connecting_client[i]->client_addr, client_info) == true) {
+					client_index = i;
+					thread_client = connecting_client[client_index];
+					break;
+				}
+			}
+			client_lock->unlock();
+			// ======================
+			
+
+			if (client_index == -1) {
+				struct incoming_client *new_client = (struct incoming_client *) malloc(sizeof(struct incoming_client));
+				memset(&new_client->client_addr, 0, sizeof(struct sockaddr_in));
+
+				new_client->client_addr.sin_family = client_info->sin_family;
+				new_client->client_addr.sin_addr = client_info->sin_addr;
+				new_client->client_addr.sin_port = client_info->sin_port;
+
+				new_client->socket_descriptor = udp_socket;
+				new_client->connection_type = params_buffer->connection_type;
+				new_client->connection_mode = params_buffer->connection_mode;
+				new_client->packet_size = htonl(params_buffer->packet_size);
+				new_client->packet_rate = htonl(params_buffer->packet_rate);
+				new_client->packet_number = htonl(params_buffer->packet_number);
+
+				// UDP server starts to initialize sending packets to client
+				new_client->next_packet_number = 0;
+				if (new_client->packet_rate > 0)
+					new_client->time_interval = 1000 * new_client->packet_size / new_client->packet_rate;
+				else
+					new_client->time_interval = 0;
+				new_client->next_packet_transmission_time = timer.Elapsed() + new_client->time_interval;
+
+				if (new_client->connection_mode == true) {
+					new_client->last_packet_expected_time = timer.Elapsed() + new_client->packet_number * new_client->time_interval;
+				}
+				// =========================================================
+
+				// debug_args(new_client);
+
+				// Add new client to list
+				client_lock->lock();
+				if (next_client >= max_client) {
+					double_threadpool();
+				}
+
+				connecting_client[next_client] = new_client;
+				if (new_client->connection_mode == false)
+					pipe_push(producers[1], new_client, 1);
+				next_client += 1;
+				udp_client += 1;
+				client_lock->unlock();
+				// ======================
+			}
+			// UDP client keeps sending packets to server
+			else if (thread_client != NULL) {
+				char *recv_buffer = (char *) params_buffer;
+				thread_client->next_packet_number = atoi(recv_buffer) + 1;
+
+				// Remove from connection since packets are all received
+				if (thread_client->next_packet_number == thread_client->packet_number) {
+					// Free incoming_client structure element with mutex lock
+					client_lock->lock();
+					// Find client index
+					int client_index = -1;
+					for (int i = 0; i < max_client; i++) {
+						if (connecting_client[i] == thread_client) {
+							client_index = i;
+							close_connection[client_index] = true;
+							break;
+						}
+					}
+					client_lock->unlock();
+				}
+				// ======================================================
+			}
+		}
+		else
+			printf("Server: recvfrom failed. Error code: %i\n", get_socket_error());
+		
+		free(params_buffer);
+		free(client_info);
+	}
+}
+// =====================================================
+
+// UDP write from server to client
+void udp_write_handler(void *input) {
+	struct incoming_client *thread_client = (struct incoming_client *) input;
+	
+	while(thread_client->next_packet_number < thread_client->packet_number || thread_client->packet_number == 0) {
+		// Compare current time and next sending time
+		long current_time = timer.Elapsed();
+		if (current_time >= thread_client->next_packet_transmission_time) {
+			char *sendbuf = (char *)calloc(thread_client->packet_size, sizeof(char));
+			memset(sendbuf, 0, thread_client->packet_size);
+			sprintf(sendbuf, "%ld", thread_client->next_packet_number);
+
+			int iResult = sendto(udp_socket, sendbuf, thread_client->packet_size, 0, (struct sockaddr *) &thread_client->client_addr, sizeof(struct sockaddr_in));
+			if (iResult == SOCKET_ERROR) {
+				printf("Server: sendto failed. Error code: %i\n", get_socket_error());
+				free(sendbuf);
+				thread_client->next_packet_number = thread_client->packet_number;
+				break;
+			}
+			// printf("Server: Send packet to client %d with packet number %ld\n", i, thread_client->next_packet_number);
+
+			current_time = timer.Elapsed();
+			long delay_sent = current_time - thread_client->next_packet_transmission_time;
+
+			thread_client->next_packet_transmission_time += (thread_client->time_interval - delay_sent);
+			thread_client->next_packet_number += 1;
+			free(sendbuf);
+		}
+	}
+	// Remove from connection since packets are all delivered
+	if (thread_client->next_packet_number == thread_client->packet_number) {
+		// Free incoming_client structure element with mutex lock
+		client_lock->lock();
+		// Find client index
+		int client_index = -1;
+		for (int i = 0; i < max_client; i++) {
+			if (strcmp((char *) &(connecting_client[i]->client_addr), (char *) &(thread_client->client_addr)) == 0) {
+				client_index = i;
+				close_connection[client_index] = true;
+				break;
+			}
+		}
+		client_lock->unlock();
+		return;
+	}
+	// ======================================================
+}
+// ===============================
+
 void connection_handler(void *input) {
 	struct incoming_client *thread_client = (struct incoming_client *) malloc(sizeof(struct incoming_client));
 	memset(&thread_client->client_addr, 0, sizeof(struct sockaddr_in));
@@ -805,10 +1109,6 @@ void connection_handler(void *input) {
 
 int main(int argc, char **argv) {
 	timer.Start();
-
-	#ifndef _WIN32
-		signal(SIGPIPE, SIG_IGN);
-	#endif
 
 	args_parser(argc, argv);
 
