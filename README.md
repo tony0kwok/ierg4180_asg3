@@ -16,7 +16,7 @@ make
 
 run the server
 ```
-./server.o --stat 1000 -lhost localhost --lport 4180 --sbufsize 1000 --rbufsize 1000 --servermodel threadpoo
+./np_server --stat 1000 -lhost localhost --lport 4180 --sbufsize 1000 --rbufsize 1000 --servermodel threadpoo
 ```
 
 run the client
